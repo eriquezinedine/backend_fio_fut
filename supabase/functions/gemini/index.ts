@@ -49,6 +49,28 @@ async function getUserIdFromAuth(req: Request): Promise<string | null> {
   }
 }
 
+// ── Get user role from profiles ─────────────────────────────────
+
+async function getUserRole(userId: string): Promise<string> {
+  const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
+  const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+  const supabase = createClient(supabaseUrl, serviceKey);
+
+  const { data, error } = await supabase
+    .from("profiles")
+    .select("role")
+    .eq("id", userId)
+    .single();
+
+  if (error || !data) return "student";
+
+  // Map profiles.role to created_by_role enum: user → student
+  const role = data.role as string;
+  if (role === "trainer") return "trainer";
+  if (role === "admin") return "admin";
+  return "student";
+}
+
 // ── Download image to base64 ────────────────────────────────────
 
 async function downloadImageToBase64(imageUrl: string): Promise<{ base64: string; contentType: string }> {
@@ -153,6 +175,34 @@ const registerFoodTool = {
   },
 };
 
+// ── Extract function call with food validation ──────────────────
+
+function extractFunctionCall(
+  response: any,
+  source: "image" | "youtube",
+): { title: string; description: string; type_food: string; ingredients: any[] } {
+  const part = response.candidates?.[0]?.content?.parts?.find((p: any) => p.functionCall);
+  if (!part?.functionCall) {
+    const textPart = response.candidates?.[0]?.content?.parts?.find((p: any) => p.text);
+    const textMsg = textPart?.text || "";
+    console.warn("zineKey - NO_FUNCTION_CALL from", source, "text:", textMsg.substring(0, 200));
+    if (source === "youtube") {
+      throw new Error("No se pudo identificar una receta de comida en el video. Asegurate de que el video muestre la preparacion de un plato.");
+    } else {
+      throw new Error("No se pudo identificar comida en la imagen. Asegurate de que la foto muestre un plato o alimento.");
+    }
+  }
+  const args = part.functionCall.args as any;
+  if (!args?.title || !args?.ingredients?.length) {
+    if (source === "youtube") {
+      throw new Error("No se pudieron detectar ingredientes en el video. Intenta con un video de cocina mas claro.");
+    } else {
+      throw new Error("No se pudieron detectar ingredientes en la imagen. Intenta con una foto mas clara del plato.");
+    }
+  }
+  return args;
+}
+
 // ── Gemini V1: with ingredient slug context ─────────────────────
 
 async function callGeminiV1(
@@ -201,15 +251,7 @@ REGLAS:
     },
   });
 
-  const part = response.candidates?.[0]?.content?.parts?.find((p: any) => p.functionCall);
-  if (!part?.functionCall) throw new Error("Gemini V1 did not return a function call");
-
-  const args = part.functionCall.args as any;
-  if (!args?.title || !args?.ingredients?.length) {
-    throw new Error("Invalid function call args from Gemini V1");
-  }
-
-  return args;
+  return extractFunctionCall(response, "image");
 }
 
 // ── Gemini V2: lightweight call without ingredient list ─────────
@@ -256,15 +298,7 @@ REGLAS:
     },
   });
 
-  const part = response.candidates?.[0]?.content?.parts?.find((p: any) => p.functionCall);
-  if (!part?.functionCall) throw new Error("Gemini V2 did not return a function call");
-
-  const args = part.functionCall.args as any;
-  if (!args?.title || !args?.ingredients?.length) {
-    throw new Error("Invalid function call args from Gemini V2");
-  }
-
-  return args;
+  return extractFunctionCall(response, "image");
 }
 
 // ── Fuzzy matching utilities ────────────────────────────────────
@@ -321,27 +355,85 @@ function fuzzyMatchIngredient(
   return bestScore >= threshold ? bestMatch : null;
 }
 
-// ── Recognize food V2 (no slug list, fuzzy matching) ────────────
+// ── Gemini YouTube: analyze food from YouTube video ─────────────
 
-async function recognizeFoodV2(imageUrl: string, userId: string) {
+async function callGeminiYoutube(
+  youtubeUrl: string,
+  ingredientContext: string,
+): Promise<{ title: string; description: string; type_food: string; ingredients: any[] }> {
+  const apiKey = Deno.env.get("GOOGLE_API_KEY");
+  if (!apiKey) throw new Error("GOOGLE_API_KEY not configured");
+
+  const ai = new GoogleGenAI({ apiKey });
+
+  const prompt = `Eres un nutricionista experto. Analiza el video de cocina de YouTube y usa la funcion register_food para registrar el plato que se prepara.
+
+Ingredientes disponibles en la base de datos (slug:nombre):
+${ingredientContext}
+
+REGLAS:
+1. Identifica TODOS los ingredientes usados en la receta del video
+2. Determina el type_food basandote en el plato preparado:
+   - "breakfast": desayuno (tostadas, cereales, huevos fritos, cafe con medialunas, etc.)
+   - "lunch": almuerzo (plato principal con proteina, ensaladas completas, pastas, etc.)
+   - "dinner": cena (similar a lunch pero tambien platos mas livianos)
+   - "snack": colacion/merienda (frutas, barritas, yogur, frutos secos, etc.)
+   Si no es claro, usa "snack" como default
+3. Para cada ingrediente, busca el slug mas cercano de la lista proporcionada
+4. Si el ingrediente NO existe en la lista, marcalo como is_new: true e incluye TODOS los campos nutricionales estimados por 100g/100ml/1 unidad
+5. Estima la cantidad de cada ingrediente usada en la receta
+6. El titulo debe ser el nombre del plato en espanol
+7. La descripcion debe ser un resumen breve de la preparacion
+8. Llama a register_food con todos los datos`;
+
+  const response = await ai.models.generateContent({
+    model: "gemini-2.5-flash",
+    contents: [
+      {
+        role: "user",
+        parts: [
+          { fileData: { fileUri: youtubeUrl } },
+          { text: prompt },
+        ],
+      },
+    ],
+    config: {
+      tools: [{ functionDeclarations: [registerFoodTool] }],
+      toolConfig: { functionCallingConfig: { mode: "ANY", allowedFunctionNames: ["register_food"] } },
+    },
+  });
+
+  return extractFunctionCall(response, "youtube");
+}
+
+// ── Shared processing: save gemini result to DB ─────────────────
+
+async function processGeminiResult(
+  geminiResult: { title: string; description: string; type_food: string; ingredients: any[] },
+  userId: string,
+  userRole: string,
+  mediaUrl: string | null,
+  dbIngredients: any[],
+  slugMap?: Map<string, any>,
+  source: "image" | "youtube" = "image",
+): Promise<any> {
   const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
   const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
   const supabase = createClient(supabaseUrl, serviceKey);
-
-  const { data: existingIngredients, error: ingredientError } = await supabase
-    .from("ingredient")
-    .select("id, name, slug, unit, category, calories, fat, carbohydrates, protein, base_quantity")
-    .order("name");
-
-  if (ingredientError) throw new Error(`DB error: ${ingredientError.message}`);
-  const dbIngredients = existingIngredients ?? [];
-
-  const geminiResult = await callGeminiV2(imageUrl);
 
   const ingredientIdMap = new Map<string, any>();
   const newIngredients: any[] = [];
 
   for (const gi of geminiResult.ingredients) {
+    // V1 path: check slugMap for existing refs
+    if (slugMap && !gi.is_new) {
+      const existing = slugMap.get(gi.slug);
+      if (existing) {
+        ingredientIdMap.set(gi.slug, existing);
+        continue;
+      }
+    }
+    // Fuzzy match
     const match = fuzzyMatchIngredient(gi.slug, gi.name, dbIngredients);
     if (match) {
       ingredientIdMap.set(gi.slug, match);
@@ -383,14 +475,25 @@ async function recognizeFoodV2(imageUrl: string, userId: string) {
     }
   }
 
+  const foodInsert: any = {
+    title: geminiResult.title,
+    description: geminiResult.description,
+    type_food: geminiResult.type_food,
+    created_by: userId,
+    created_by_role: userRole,
+    is_ai_generated: true,
+  };
+  if (mediaUrl) {
+    if (source === "youtube") {
+      foodInsert.link_youtube = mediaUrl;
+    } else {
+      foodInsert.image_url = mediaUrl;
+    }
+  }
+
   const { data: food, error: foodError } = await supabase
     .from("food")
-    .insert({
-      title: geminiResult.title,
-      description: geminiResult.description,
-      type_food: geminiResult.type_food,
-      image_url: imageUrl,
-    })
+    .insert(foodInsert)
     .select("id")
     .single();
 
@@ -455,34 +558,28 @@ async function recognizeFoodV2(imageUrl: string, userId: string) {
 
   return {
     success: true,
-    version: "v2",
     food: {
       id: food.id,
       title: geminiResult.title,
       description: geminiResult.description,
       type_food: geminiResult.type_food,
-      image_url: imageUrl,
+      image_url: source === "youtube" ? null : mediaUrl,
+      link_youtube: source === "youtube" ? mediaUrl : null,
+      link_tiktok: null,
+      link_instagram: null,
       ingredients: responseIngredients,
     },
     food_schedule: schedule,
   };
 }
 
-// ── Recognize food action (V1 with V2 fallback) ────────────────
+// ── Recognize food from image (V1 with V2 fallback) ─────────────
 
 async function recognizeFood(imageUrl: string, userId: string): Promise<any> {
-  try {
-    return await recognizeFoodV1(imageUrl, userId);
-  } catch (v1Error) {
-    console.warn("zineKey - V1_FAILED, falling back to V2:", v1Error instanceof Error ? v1Error.message : v1Error);
-    return await recognizeFoodV2(imageUrl, userId);
-  }
-}
-
-async function recognizeFoodV1(imageUrl: string, userId: string) {
   const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
   const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
   const supabase = createClient(supabaseUrl, serviceKey);
+  const userRole = await getUserRole(userId);
 
   const { data: existingIngredients, error: ingredientError } = await supabase
     .from("ingredient")
@@ -490,143 +587,60 @@ async function recognizeFoodV1(imageUrl: string, userId: string) {
     .order("name");
 
   if (ingredientError) throw new Error(`DB error: ${ingredientError.message}`);
+  const dbIngredients = existingIngredients ?? [];
 
+  // Build slug context for V1
   const slugMap = new Map<string, any>();
   const contextParts: string[] = [];
-  for (const ing of existingIngredients ?? []) {
+  for (const ing of dbIngredients) {
     if (ing.slug) {
       slugMap.set(ing.slug, ing);
       contextParts.push(`${ing.slug}:${ing.name}`);
     }
   }
-  const ingredientContext = contextParts.join(",");
 
-  const geminiResult = await callGeminiV1(imageUrl, ingredientContext);
+  try {
+    // V1: with slug context
+    const geminiResult = await callGeminiV1(imageUrl, contextParts.join(","));
+    return await processGeminiResult(geminiResult, userId, userRole, imageUrl, dbIngredients, slugMap);
+  } catch (v1Error) {
+    const msg = v1Error instanceof Error ? v1Error.message : String(v1Error);
+    // Propagate user-facing food validation errors
+    if (msg.startsWith("No se pudo")) throw v1Error;
+    console.warn("zineKey - V1_FAILED, falling back to V2:", msg);
+    // V2: fuzzy matching only
+    const geminiResult = await callGeminiV2(imageUrl);
+    return await processGeminiResult(geminiResult, userId, userRole, imageUrl, dbIngredients);
+  }
+}
 
-  const newIngredients = geminiResult.ingredients.filter((i: any) => i.is_new);
-  const existingRefs = geminiResult.ingredients.filter((i: any) => !i.is_new);
+// ── Recognize food from YouTube video ───────────────────────────
 
-  const ingredientIdMap = new Map<string, any>();
+async function recognizeFoodYoutube(youtubeUrl: string, userId: string): Promise<any> {
+  const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
+  const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+  const supabase = createClient(supabaseUrl, serviceKey);
+  const userRole = await getUserRole(userId);
 
-  if (newIngredients.length > 0) {
-    const toInsert = newIngredients.map((i: any) => ({
-      name: i.name || i.slug.replace(/-/g, " "),
-      slug: i.slug,
-      calories: i.calories ?? 0,
-      fat: i.fat ?? 0,
-      carbohydrates: i.carbohydrates ?? 0,
-      protein: i.protein ?? 0,
-      unit: i.unit ?? "grams",
-      base_quantity: i.base_quantity ?? 100,
-      category: i.category ?? null,
-    }));
+  const { data: existingIngredients, error: ingredientError } = await supabase
+    .from("ingredient")
+    .select("id, name, slug, unit, category, calories, fat, carbohydrates, protein, base_quantity")
+    .order("name");
 
-    const { error: insertError } = await supabase
-      .from("ingredient")
-      .upsert(toInsert, { onConflict: "slug", ignoreDuplicates: true });
+  if (ingredientError) throw new Error(`DB error: ${ingredientError.message}`);
+  const dbIngredients = existingIngredients ?? [];
 
-    if (insertError) throw new Error(`Insert ingredient error: ${insertError.message}`);
-
-    const newSlugs = newIngredients.map((i: any) => i.slug);
-    const { data: createdIngredients } = await supabase
-      .from("ingredient")
-      .select("id, name, slug, unit, category, calories, fat, carbohydrates, protein, base_quantity")
-      .in("slug", newSlugs);
-
-    for (const ing of createdIngredients ?? []) {
-      ingredientIdMap.set(ing.slug, ing);
+  const slugMap = new Map<string, any>();
+  const contextParts: string[] = [];
+  for (const ing of dbIngredients) {
+    if (ing.slug) {
+      slugMap.set(ing.slug, ing);
+      contextParts.push(`${ing.slug}:${ing.name}`);
     }
   }
 
-  for (const ref of existingRefs) {
-    const existing = slugMap.get(ref.slug);
-    if (existing) {
-      ingredientIdMap.set(ref.slug, existing);
-    }
-  }
-
-  const { data: food, error: foodError } = await supabase
-    .from("food")
-    .insert({
-      title: geminiResult.title,
-      description: geminiResult.description,
-      type_food: geminiResult.type_food,
-      image_url: imageUrl,
-    })
-    .select("id")
-    .single();
-
-  if (foodError) throw new Error(`Insert food error: ${foodError.message}`);
-
-  const details = geminiResult.ingredients
-    .filter((i: any) => ingredientIdMap.has(i.slug))
-    .map((i: any) => ({
-      id_food: food.id,
-      id_ingredient: ingredientIdMap.get(i.slug).id,
-      quantity: i.quantity ?? 0,
-    }));
-
-  let insertedDetails: any[] = [];
-  if (details.length > 0) {
-    const { data: detailData, error: detailError } = await supabase
-      .from("detail_food_ingredient")
-      .insert(details)
-      .select("id, id_ingredient, quantity");
-
-    if (detailError) throw new Error(`Insert details error: ${detailError.message}`);
-    insertedDetails = detailData ?? [];
-  }
-
-  const today = new Date().toISOString().split("T")[0];
-  const { data: schedule, error: scheduleError } = await supabase
-    .from("food_schedule")
-    .insert({
-      id_food: food.id,
-      id_user_profile: userId,
-      id_created_by: userId,
-      schedule_type: "today",
-      start_date: today,
-      is_completed: true,
-    })
-    .select("id, schedule_type, start_date, is_completed")
-    .single();
-
-  if (scheduleError) throw new Error(`Insert schedule error: ${scheduleError.message}`);
-
-  const responseIngredients = insertedDetails.map((detail: any) => {
-    const slug = geminiResult.ingredients.find(
-      (i: any) => ingredientIdMap.get(i.slug)?.id === detail.id_ingredient,
-    )?.slug;
-    const ingData = slug ? ingredientIdMap.get(slug) : null;
-
-    return {
-      id: detail.id_ingredient,
-      id_detail_food_ingredient: detail.id,
-      name: ingData?.name ?? "Unknown",
-      slug: ingData?.slug ?? "",
-      calories: Number(ingData?.calories ?? 0),
-      fat: Number(ingData?.fat ?? 0),
-      carbohydrates: Number(ingData?.carbohydrates ?? 0),
-      protein: Number(ingData?.protein ?? 0),
-      unit: ingData?.unit ?? "grams",
-      base_quantity: Number(ingData?.base_quantity ?? 100),
-      category: ingData?.category ?? null,
-      quantity: Number(detail.quantity),
-    };
-  });
-
-  return {
-    success: true,
-    food: {
-      id: food.id,
-      title: geminiResult.title,
-      description: geminiResult.description,
-      type_food: geminiResult.type_food,
-      image_url: imageUrl,
-      ingredients: responseIngredients,
-    },
-    food_schedule: schedule,
-  };
+  const geminiResult = await callGeminiYoutube(youtubeUrl, contextParts.join(","));
+  return await processGeminiResult(geminiResult, userId, userRole, youtubeUrl, dbIngredients, slugMap, "youtube");
 }
 
 // ── Main handler ────────────────────────────────────────────────
@@ -660,16 +674,24 @@ Deno.serve(async (req: Request) => {
       case "recognize-food": {
         const { image_url } = body;
         if (!image_url || typeof image_url !== "string") {
-          console.error("zineKey - MISSING_IMAGE_URL");
           return errorResponse("Missing or invalid 'image_url'");
         }
-        console.log("zineKey - RECOGNIZE_START: image_url =", image_url);
         const result = await recognizeFood(image_url, userId);
-        console.log("zineKey - RECOGNIZE_OK: food_id =", result?.food?.id);
+        return jsonResponse(result);
+      }
+      case "recognize-food-youtube": {
+        const { youtube_url } = body;
+        if (!youtube_url || typeof youtube_url !== "string") {
+          return errorResponse("Missing or invalid 'youtube_url'");
+        }
+        const ytRegex = /^https?:\/\/(www\.)?(youtube\.com|youtu\.be)\//;
+        if (!ytRegex.test(youtube_url)) {
+          return errorResponse("Invalid YouTube URL");
+        }
+        const result = await recognizeFoodYoutube(youtube_url, userId);
         return jsonResponse(result);
       }
       default:
-        console.error("zineKey - UNKNOWN_ACTION:", action);
         return errorResponse(`Unknown action: ${action}`);
     }
   } catch (err) {
